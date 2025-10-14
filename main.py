@@ -10,6 +10,12 @@ from PIL import Image
 import io
 import base64
 from torchvision import transforms
+import os
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -18,6 +24,7 @@ CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST"], "allow_
 
 # Load device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.debug(f"Using device: {device}")
 class_names = ["benign", "malignant", "normal"]
 
 # Image transform (same as training)
@@ -33,71 +40,39 @@ class SegmentationHead(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, 256, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(256)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(256, 128, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, out_channels, kernel_size=1)
-        
+        self.conv2 = nn.Conv2d(256, out_channels, kernel_size=1)
+
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        x = self.conv3(x)
-        return x
+        return self.conv2(x)
 
-class HybridDenseNet(nn.Module):
-    def __init__(self, num_classes=3, backbone_name="densenet121", pretrained=True):
+class HybridResNet(nn.Module):
+    def __init__(self, num_classes=3, backbone_name="resnet18", pretrained=True):
         super().__init__()
-        self.num_classes = num_classes
-        self.backbone_name = backbone_name
-        
-        if backbone_name == "densenet121":
-            backbone = models.densenet121(pretrained=pretrained)
-            in_features = 1024
-        elif backbone_name == "densenet169":
-            backbone = models.densenet169(pretrained=pretrained)
-            in_features = 1664
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone_name}")
+        backbone_fn = getattr(models, backbone_name)
+        backbone = backbone_fn(pretrained=pretrained)
 
-        self.backbone = backbone.features
-        self.relu = nn.ReLU(inplace=True)
+        # Feature extractor (remove avgpool + fc)
+        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Classification head
+        in_features = 512  # ResNet18's output features
         self.classifier = nn.Sequential(
             nn.Linear(in_features, 512),
             nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
+            nn.Linear(512, num_classes)
         )
-        self.seg_head = SegmentationHead(in_channels=in_features, out_channels=1)
-        self._initialize_weights()
 
-    def _initialize_weights(self):
-        for m in self.classifier.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-        for m in self.seg_head.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        # Segmentation head
+        self.seg_head = SegmentationHead(in_channels=in_features, out_channels=1)
 
     def forward(self, x):
         feats = self.backbone(x)
-        feats = self.relu(feats)
         pooled = self.avgpool(feats)
         pooled = torch.flatten(pooled, 1)
         class_out = self.classifier(pooled)
@@ -106,25 +81,33 @@ class HybridDenseNet(nn.Module):
         return class_out, seg_out
 
 def predict_tumor(image_b64: str, pixel_spacing: float = None):
+    logger.debug("Starting predict_tumor")
     try:
-        model = HybridDenseNet(num_classes=3, backbone_name="densenet121", pretrained=False).to(device)
-        state_dict = torch.load("hybrid_breast_cancer_desnet(3).pth", map_location=device)
+        model = HybridResNet(num_classes=3, backbone_name="resnet18", pretrained=False).to(device)
+        model_path = os.path.join(os.path.dirname(__file__), "hybrid_breast_cancer(1).pth")
+        logger.debug(f"Loading model from: {model_path}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found at: {model_path}")
+        state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
-        if model is None:
-            return jsonify({"error": "Model not loaded"}), 503
         model.eval()
-        print("✅ Model loaded successfully")
+        logger.info("✅ Model loaded successfully")
     except Exception as e:
-        return jsonify({"error": f"Model failed: {str(e)}"}), 500
+        logger.error(f"Model loading failed: {str(e)}")
+        raise Exception(f"Model failed: {str(e)}")
 
     try:
+        logger.debug("Decoding image")
         image_bytes = base64.b64decode(image_b64)
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         orig_w, orig_h = image.size
+        logger.debug(f"Image loaded: {orig_w}x{orig_h}")
     except Exception as e:
-        return jsonify({"error": f"Invalid image data: {str(e)}"}), 400
+        logger.error(f"Image processing failed: {str(e)}")
+        raise Exception(f"Invalid image data: {str(e)}")
 
     input_tensor = image_transform(image).unsqueeze(0).to(device)
+    logger.debug("Image transformed and moved to device")
 
     with torch.no_grad():
         outputs = model(input_tensor)
@@ -137,6 +120,7 @@ def predict_tumor(image_b64: str, pixel_spacing: float = None):
         top_prob, top_class = torch.max(probs, 1)
         predicted_class = class_names[top_class.item()]
         predicted_prob = float(top_prob.item())
+        logger.debug(f"Prediction: {predicted_class} ({predicted_prob:.4f})")
 
         bbox = None
         length_px = diameter_px = None
@@ -173,6 +157,7 @@ def predict_tumor(image_b64: str, pixel_spacing: float = None):
                 cv2.rectangle(img_cv, (x_orig, y_orig), (x_orig+w_orig, y_orig+h_orig), (0, 255, 0), 2)
                 _, buffer = cv2.imencode(".png", img_cv)
                 annotated_b64 = base64.b64encode(buffer).decode("utf-8")
+                logger.debug("Segmentation and bounding box generated")
 
     return {
         "class": predicted_class,
@@ -188,38 +173,50 @@ def predict_tumor(image_b64: str, pixel_spacing: float = None):
 
 items = []
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET"], strict_slashes=False)
 def root():
+    logger.debug("Handling GET /")
     return jsonify({"Hello": "world"})
 
-@app.route("/items", methods=["POST"])
+@app.route("/items", methods=["POST"], strict_slashes=False)
 def create_item():
+    logger.debug("Handling POST /items")
     item = request.args.get("item")
     if not item:
+        logger.warning("Item parameter missing")
         return jsonify({"error": "Item parameter is required"}), 400
     items.append(item)
+    logger.debug(f"Item added: {item}")
     return jsonify(item)
 
-@app.route("/items/<int:item_id>", methods=["GET"])
+@app.route("/items/<int:item_id>", methods=["GET"], strict_slashes=False)
 def get_item(item_id):
+    logger.debug(f"Handling GET /items/{item_id}")
     try:
         item = items[item_id]
+        logger.debug(f"Item retrieved: {item}")
         return jsonify(item)
     except IndexError:
+        logger.warning(f"Item {item_id} not found")
         return jsonify({"error": "Item not found"}), 404
 
-@app.route("/predict", methods=["POST"])
+@app.route("/predict", methods=["POST"], strict_slashes=False)
 def predict_api():
+    logger.debug("Handling POST /predict")
     try:
         image_b64 = request.form.get("image_b64")
         pixel_spacing = float(request.form.get("pixel_spacing", 0.5))
+        logger.debug(f"Received image_b64 (len={len(image_b64) if image_b64 else 0}), pixel_spacing={pixel_spacing}")
         if not image_b64:
+            logger.warning("image_b64 is required")
             return jsonify({"error": "image_b64 is required"}), 400
         result = predict_tumor(image_b64, pixel_spacing)
-        print(result)
+        logger.info(f"Prediction result: {result}")
         return jsonify(result)
     except Exception as e:
+        logger.error(f"Prediction failed: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
+    logger.info("Starting Flask app")
     app.run(debug=True)
