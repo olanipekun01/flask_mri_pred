@@ -84,7 +84,7 @@ def predict_tumor(image_b64: str, pixel_spacing: float = None):
     logger.debug("Starting predict_tumor")
     try:
         model = HybridResNet(num_classes=3, backbone_name="resnet18", pretrained=False).to(device)
-        model_path = os.path.join(os.path.dirname(__file__), "hybrid_breast_cancer(1).pth")
+        model_path = os.path.join(os.path.dirname(__file__), "hybrid_breast_cancer2.pth")
         logger.debug(f"Loading model from: {model_path}")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found at: {model_path}")
